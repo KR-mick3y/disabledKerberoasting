@@ -222,7 +222,7 @@ def main():
 if __name__ == "__main__":
     version.BANNER = ""
     try:
-        print(f'Disabled Kerberoasting v0.7 - Copyright 2025 All rights reserved by mick3y')
+        print(f'Disabled Kerberoasting v0.7 - Copyright 2025 mick3y')
         main()
     except Exception as e:
         sys.exit(f"[-] {e}")
